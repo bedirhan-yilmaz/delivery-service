@@ -1,11 +1,15 @@
 import collections.abc
 import dataclasses
 import datetime
+
+import typing
+
 import dataclasses_json
 import http
 import io
 import logging
 import tarfile
+import tempfile
 import zlib
 
 import aiohttp.web
@@ -1259,24 +1263,20 @@ class ComplianceSummary(aiohttp.web.View):
         )
 
 
-async def _stream_sbom_tar(
+async def _write_sbom_tar_gz(
     db_session: sqlasync.session.AsyncSession,
     rows: list,
-    write_fn: collections.abc.Callable[[bytes], collections.abc.Awaitable[None]],
+    dest: typing.IO,
 ) -> None:
     '''
-    Streams the gzip-compressed tar archive of SBOM blobs by iterating `rows` (ArtefactMetaData
-    query results) and writing each compressed chunk via `write_fn`. LOB data is read in 4096-byte
+    Writes a gzip-compressed tar archive of SBOM blobs into `dest`. LOB data is read in 4096-byte
     chunks and is never held in memory beyond a single iteration.
-
-    `write_fn` must be an async callable accepting a single `bytes` argument, e.g.
-    `response.write` or a counting coroutine.
     '''
     compressor = zlib.compressobj(zlib.Z_BEST_COMPRESSION, wbits=31)
 
-    async def write_compressed(data: bytes) -> None:
+    def write_compressed(data: bytes) -> None:
         if chunk := compressor.compress(data):
-            await write_fn(chunk)
+            dest.write(chunk)
 
     for row in rows:
         artefact_metadatum = du.db_artefact_metadata_row_to_dso(row)
@@ -1300,7 +1300,7 @@ async def _stream_sbom_tar(
         tarinfo.size = blob_metadata.size
 
         tarinfo_bytes = tarinfo.tobuf()
-        await write_compressed(tarinfo_bytes)
+        write_compressed(tarinfo_bytes)
         written_bytes = len(tarinfo_bytes)
 
         conn = None
@@ -1325,13 +1325,13 @@ async def _stream_sbom_tar(
                 if not (buffer := result.scalar()):
                     break
 
-                await write_compressed(buffer)
+                write_compressed(buffer)
                 written_bytes += len(buffer)
 
             # pad to full blocks
             if remainder := written_bytes % tarfile.BLOCKSIZE:
                 missing = tarfile.BLOCKSIZE - remainder
-                await write_compressed(tarfile.NUL * missing)
+                write_compressed(tarfile.NUL * missing)
         finally:
             if conn is not None and lo_fd is not None:
                 await conn.exec_driver_sql(
@@ -1340,10 +1340,10 @@ async def _stream_sbom_tar(
                 )
 
     # terminate tarchive w/ two empty blocks
-    await write_compressed(tarfile.NUL * tarfile.BLOCKSIZE * 2)
+    write_compressed(tarfile.NUL * tarfile.BLOCKSIZE * 2)
 
     if final_chunk := compressor.flush(zlib.Z_FINISH):
-        await write_fn(final_chunk)
+        dest.write(final_chunk)
 
 
 class DownloadSBOM(aiohttp.web.View):
@@ -1476,30 +1476,28 @@ class DownloadSBOM(aiohttp.web.View):
             sa.or_(*artefact_queries),
         )
 
-        # Pass 1: stream all SBOM blobs through a compressor into a byte counter to determine
-        # the exact compressed content length before sending any response headers.
-        compressed_size = 0
-
-        async def count_bytes(data: bytes) -> None:
-            nonlocal compressed_size
-            compressed_size += len(data)
-
         rows = (await db_session.execute(db_statement)).all()
-        await _stream_sbom_tar(db_session, rows, count_bytes)
 
-        # Pass 2: stream again to the client, now with Content-Length set.
-        filename = f'{component.name}_{component.version}.sboms.tar.gz'.replace('/', '_')
-        response = aiohttp.web.StreamResponse(
-            headers={
-                'Content-Type': 'application/gzip',
-                'Content-Length': str(compressed_size),
-                'Content-Disposition': f'attachment; filename="{filename}"',
-            },
-        )
-        await response.prepare(self.request)
+        # Pass 1: compress all SBOM blobs into a local temp file so that the exact compressed
+        # size is known before any response headers are sent.
+        with tempfile.TemporaryFile() as tmp:
+            await _write_sbom_tar_gz(db_session, rows, tmp)
+            compressed_size = tmp.tell()
 
-        rows = (await db_session.execute(db_statement)).all()
-        await _stream_sbom_tar(db_session, rows, response.write)
+            # Pass 2: stream temp file content to client with Content-Length set.
+            filename = f'{component.name}_{component.version}.sboms.tar.gz'.replace('/', '_')
+            response = aiohttp.web.StreamResponse(
+                headers={
+                    'Content-Type': 'application/gzip',
+                    'Content-Length': str(compressed_size),
+                    'Content-Disposition': f'attachment; filename="{filename}"',
+                },
+            )
+            await response.prepare(self.request)
+
+            tmp.seek(0)
+            while chunk := tmp.read(65536):
+                await response.write(chunk)
 
         await response.write_eof()
         return response
