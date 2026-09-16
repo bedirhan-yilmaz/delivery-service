@@ -11,7 +11,6 @@ import time
 import ci.log
 import cnudie.retrieve
 import oci.client
-import oci.model
 import requests.exceptions
 
 import bdba.client
@@ -22,7 +21,6 @@ import k8s.util
 import k8s.logging
 import ocm.iter
 import ocm_util
-import odg.labels
 import odg.model
 import odg.util
 import odg.extensions_cfg
@@ -43,33 +41,18 @@ class SBOM:
     sbom_format: odg.extensions_cfg.SbomFormat
 
 
-def _identity_matches(identity: dict, resource: ocm.Resource) -> bool:
-    if identity.get('name') != resource.name:
-        return False
-    if 'version' in identity and identity['version'] != resource.version:
-        return False
-    extra_keys = {k for k in identity if k not in ('name', 'version')}
-    if extra_keys != set(resource.extraIdentity):
-        return False
-    return all(resource.extraIdentity.get(k) == identity[k] for k in extra_keys)
-
-
 def find_ocm_sbom_resource(
     component: ocm.Component,
     resource: ocm.Resource,
 ) -> ocm.Resource | None:
-    for candidate in component.resources:
-        label = candidate.find_label(odg.labels.ArtifactReferencesLabel.name)
-        if not label or label.version != odg.labels.ArtifactReferencesLabel.label_version:
-            continue
-        for entry in label.value:
-            if _identity_matches(entry.get('identity', {}), resource):
-                logger.info(
-                    f'Found OCM-shipped SBoM resource {candidate.name!r} '
-                    f'for resource {resource.name!r}'
-                )
-                return candidate
-    return None
+    return next(
+        ocm_util.iter_resources_referencing(
+            component=component,
+            resource=resource,
+            resource_type='sbom',
+        ),
+        None,
+    )
 
 
 def _detect_sbom_format(sbom_raw: dict) -> odg.extensions_cfg.SbomFormat:
@@ -77,41 +60,22 @@ def _detect_sbom_format(sbom_raw: dict) -> odg.extensions_cfg.SbomFormat:
         return odg.extensions_cfg.SbomFormat.CYCLONEDX
     if 'spdxVersion' in sbom_raw:
         return odg.extensions_cfg.SbomFormat.SPDX
-    return odg.extensions_cfg.SbomFormat.CYCLONEDX
+    raise ValueError(f'unable to detect SBOM format from document keys: {list(sbom_raw.keys())}')
 
 
 def fetch_ocm_sbom(
     sbom_resource: ocm.Resource,
     oci_client: oci.client.Client,
     component: ocm.Component,
+    secret_factory: secret_mgmt.SecretFactory,
 ) -> SBOM:
-    access = sbom_resource.access
-
-    if access.type == ocm.AccessType.OCI_REGISTRY:
-        manifest = oci_client.manifest(access.imageReference)
-        if isinstance(manifest, oci.model.OciImageManifestList):
-            sub = manifest.manifests[0]
-            image_ref = oci.model.OciImageReference.to_image_ref(access.imageReference)
-            manifest = oci_client.manifest(f'{image_ref.ref_without_tag}@{sub.digest}')
-        layer = manifest.layers[0]
-        blob = oci_client.blob(access.imageReference, layer.digest, stream=False)
-        raw = json.loads(blob.content)
-
-    elif access.type == ocm.AccessType.LOCAL_BLOB:
-        image_reference = component.current_ocm_repo.component_version_oci_ref(component)
-        descriptor = ocm_util.local_blob_access_as_blob_descriptor(
-            access=access,
-            oci_client=oci_client,
-            image_reference=image_reference,
-        )
-        raw = json.loads(b''.join(descriptor.content))
-
-    else:
-        raise ValueError(
-            f'Unsupported access type for OCM-shipped SBoM resource '
-            f'{sbom_resource.name!r}: {access.type}'
-        )
-
+    descriptor = next(ocm_util.iter_blob_descriptors(
+        component=component,
+        access=sbom_resource.access,
+        oci_client=oci_client,
+        secret_factory=secret_factory,
+    ))
+    raw = json.loads(b''.join(descriptor.content))
     return SBOM(sbom_raw=raw, sbom_format=_detect_sbom_format(raw))
 
 
@@ -359,6 +323,7 @@ def generate_sbom_for_artefact(
                 sbom_resource=ocm_sbom_resource,
                 oci_client=oci_client,
                 component=resource_node.component,
+                secret_factory=secret_factory,
             )
             logger.info(
                 f'Using OCM-shipped SBoM resource {ocm_sbom_resource.name!r} for {artefact}'
@@ -369,6 +334,7 @@ def generate_sbom_for_artefact(
                 f'(resource: {ocm_sbom_resource.name!r}): {e}. '
                 'Falling back to ad-hoc generation.'
             )
+            sbom_result = None
 
     if not sbom_result:
         logger.info(f'Scanning using mode {extension_cfg.generation_mode}')

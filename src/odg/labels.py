@@ -26,6 +26,7 @@ class LabelValue:
 class Label:
     name: str
     value: LabelValue
+    version: str | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,11 +81,15 @@ class RiskProfileLabel(Label):
 class ArtifactReferenceEntry:
     identity: dict
 
+    def __post_init__(self):
+        if 'name' not in self.identity:
+            raise ValueError(f'The identity must contain a "name" property, found: {self.identity}')
+
 
 @dataclasses.dataclass(frozen=True)
 class ArtifactReferencesLabel(Label):
     name = 'ocm.software/artifact-references'
-    label_version = 'v1alpha1'
+    version: str = 'v1alpha1'
     value: tuple[ArtifactReferenceEntry, ...]
 
 
@@ -124,6 +129,7 @@ def deserialise_label(
         label = {
             'name': label.name,
             'value': label.value,
+            'version': label.version,
         }
 
     name = _LABEL_NAME_ALIASES.get(label['name'], label['name'])
