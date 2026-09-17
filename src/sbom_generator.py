@@ -49,7 +49,7 @@ def find_ocm_sbom_resource(
         ocm_util.iter_resources_referencing(
             component=component,
             resource=resource,
-            resource_type='sbom',
+            resource_type=ocm.ArtefactType.SBOM,
         ),
         None,
     )
